@@ -188,11 +188,15 @@ def validate_input(job_input):
     # Optional: API key for Comfy.org API Nodes, passed per-request
     comfy_org_api_key = job_input.get("comfy_org_api_key")
 
+    # Optional: presigned URL assets to download at runtime
+    assets = job_input.get("assets")
+
     # Return validated data and no error
     return {
         "workflow": workflow,
         "images": images,
         "comfy_org_api_key": comfy_org_api_key,
+        "assets": assets,
     }, None
 
 
@@ -371,6 +375,57 @@ def upload_images(images):
         "message": "All images uploaded successfully",
         "details": responses,
     }
+
+
+def download_and_upload_assets(assets):
+    """
+    Download assets from presigned URLs and upload them to ComfyUI via /upload/image.
+
+    Args:
+        assets (list): A list of dicts with 'name' (str) and 'url' (str) keys.
+
+    Returns:
+        dict: {"status": "success"} or {"status": "error", "details": [...]}
+    """
+    if not assets:
+        return {"status": "success"}
+
+    upload_errors = []
+    print(f"worker-comfyui - Downloading and uploading {len(assets)} asset(s)...")
+
+    for asset in assets:
+        name = asset.get("name", "unknown")
+        url = asset.get("url")
+        try:
+            response = requests.get(url, stream=True, timeout=60)
+            response.raise_for_status()
+
+            files = {
+                "image": (name, response.raw, "application/octet-stream"),
+                "overwrite": (None, "true"),
+            }
+            upload_resp = requests.post(
+                f"http://{COMFY_HOST}/upload/image", files=files, timeout=30
+            )
+            upload_resp.raise_for_status()
+            print(f"worker-comfyui - Successfully downloaded and uploaded asset: {name}")
+
+        except requests.Timeout:
+            error_msg = f"Timeout processing asset {name}"
+            print(f"worker-comfyui - {error_msg}")
+            upload_errors.append(error_msg)
+        except requests.RequestException as e:
+            error_msg = f"Error processing asset {name}: {e}"
+            print(f"worker-comfyui - {error_msg}")
+            upload_errors.append(error_msg)
+        except Exception as e:
+            error_msg = f"Unexpected error processing asset {name}: {e}"
+            print(f"worker-comfyui - {error_msg}")
+            upload_errors.append(error_msg)
+
+    if upload_errors:
+        return {"status": "error", "details": upload_errors}
+    return {"status": "success"}
 
 
 def get_available_models():
@@ -596,6 +651,7 @@ def handler(job):
     # Extract validated data
     workflow = validated_data["workflow"]
     input_images = validated_data.get("images")
+    input_assets = validated_data.get("assets")
 
     # Make sure that the ComfyUI HTTP API is available before proceeding
     if not check_server(
@@ -615,6 +671,15 @@ def handler(job):
             return {
                 "error": "Failed to upload one or more input images",
                 "details": upload_result["details"],
+            }
+
+    # Download and upload presigned URL assets if provided
+    if input_assets:
+        assets_result = download_and_upload_assets(input_assets)
+        if assets_result["status"] == "error":
+            return {
+                "error": "Failed to download or upload one or more assets",
+                "details": assets_result["details"],
             }
 
     ws = None
