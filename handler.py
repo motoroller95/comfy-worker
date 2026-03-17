@@ -14,6 +14,7 @@ import tempfile
 import socket
 import traceback
 import logging
+import subprocess
 
 from network_volume import (
     is_network_volume_debug_enabled,
@@ -58,6 +59,8 @@ COMFY_HOST = "127.0.0.1:8188"
 # Enforce a clean state after each job is done
 # see https://docs.runpod.io/docs/handler-additional-controls#refresh-worker
 REFRESH_WORKER = os.environ.get("REFRESH_WORKER", "false").lower() == "true"
+CMD_EXEC_DEFAULT_TIMEOUT_S = int(os.environ.get("CMD_EXEC_DEFAULT_TIMEOUT_S", 30))
+CMD_EXEC_MAX_OUTPUT_CHARS = int(os.environ.get("CMD_EXEC_MAX_OUTPUT_CHARS", 50000))
 
 # ---------------------------------------------------------------------------
 # Helper: quick reachability probe of ComfyUI HTTP endpoint (port 8188)
@@ -169,10 +172,18 @@ def validate_input(job_input):
         except json.JSONDecodeError:
             return None, "Invalid JSON format in input"
 
-    # Validate 'workflow' in input
+    # Optional command-mode input
+    cmd = job_input.get("cmd")
+    if cmd is not None:
+        if not isinstance(cmd, str) or not cmd.strip():
+            return None, "'cmd' must be a non-empty string"
+
+    # Validate mutually exclusive execution modes
     workflow = job_input.get("workflow")
-    if workflow is None:
-        return None, "Missing 'workflow' parameter"
+    if workflow is None and cmd is None:
+        return None, "Missing 'workflow' or 'cmd' parameter"
+    if workflow is not None and cmd is not None:
+        return None, "Provide either 'workflow' or 'cmd', not both"
 
     # Validate 'images' in input, if provided
     images = job_input.get("images")
@@ -191,13 +202,87 @@ def validate_input(job_input):
     # Optional: presigned URL assets to download at runtime
     assets = job_input.get("assets")
 
+    # Optional command timeout override (seconds)
+    cmd_timeout = job_input.get("cmd_timeout")
+    if cmd_timeout is not None:
+        if not isinstance(cmd_timeout, int):
+            return None, "'cmd_timeout' must be an integer"
+        if cmd_timeout <= 0:
+            return None, "'cmd_timeout' must be greater than 0"
+
     # Return validated data and no error
     return {
         "workflow": workflow,
         "images": images,
         "comfy_org_api_key": comfy_org_api_key,
         "assets": assets,
+        "cmd": cmd,
+        "cmd_timeout": cmd_timeout,
     }, None
+
+
+def _truncate_output(text):
+    """
+    Truncate command output to keep payload size bounded.
+    """
+    if text is None:
+        return ""
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", errors="replace")
+    if len(text) <= CMD_EXEC_MAX_OUTPUT_CHARS:
+        return text
+    suffix = "\n... output truncated ..."
+    keep = max(0, CMD_EXEC_MAX_OUTPUT_CHARS - len(suffix))
+    return text[:keep] + suffix
+
+
+def execute_command(cmd, timeout_s=None):
+    """
+    Execute shell command and return stdout, stderr and return code.
+
+    Args:
+        cmd (str): Command string to execute.
+        timeout_s (int | None): Timeout in seconds.
+
+    Returns:
+        dict: Command execution result.
+    """
+    effective_timeout = (
+        timeout_s
+        if isinstance(timeout_s, int) and timeout_s > 0
+        else CMD_EXEC_DEFAULT_TIMEOUT_S
+    )
+    print(
+        f"worker-comfyui - Running command (timeout={effective_timeout}s): {cmd}"
+    )
+    try:
+        result = subprocess.run(
+            cmd,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=effective_timeout,
+            check=False,
+        )
+        return {
+            "stdout": _truncate_output(result.stdout),
+            "stderr": _truncate_output(result.stderr),
+            "return_code": result.returncode,
+        }
+    except subprocess.TimeoutExpired as timeout_error:
+        return {
+            "stdout": _truncate_output(timeout_error.stdout),
+            "stderr": _truncate_output(timeout_error.stderr),
+            "return_code": -1,
+            "error": f"Command timed out after {effective_timeout} seconds",
+        }
+    except Exception as e:
+        return {
+            "stdout": "",
+            "stderr": str(e),
+            "return_code": -1,
+            "error": f"Failed to execute command: {e}",
+        }
 
 
 def _get_comfyui_pid():
@@ -649,6 +734,11 @@ def handler(job):
         return {"error": error_message}
 
     # Extract validated data
+    input_cmd = validated_data.get("cmd")
+    input_cmd_timeout = validated_data.get("cmd_timeout")
+    if input_cmd is not None:
+        return execute_command(input_cmd, input_cmd_timeout)
+
     workflow = validated_data["workflow"]
     input_images = validated_data.get("images")
     input_assets = validated_data.get("assets")
